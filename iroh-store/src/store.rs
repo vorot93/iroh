@@ -1,12 +1,12 @@
 use std::{
+    borrow::Cow,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    thread::available_parallelism,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use cid::Cid;
 use iroh_metrics::{
     core::{MObserver, MRecorder},
@@ -14,16 +14,17 @@ use iroh_metrics::{
     store::{StoreHistograms, StoreMetrics},
 };
 use iroh_rpc_client::Client as RpcClient;
-use multihash::Multihash;
-use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, DBPinnableSlice, Direction, IteratorMode, Options,
-    WriteBatch, DB as RocksDb,
+use libmdbx::{
+    DatabaseFlags, Environment, EnvironmentKind, TransactionKind, WriteFlags, WriteMap, RW,
 };
+use multihash::Multihash;
 use smallvec::SmallVec;
 use tokio::task;
 
-use crate::cf::{GraphV0, MetadataV0, CF_BLOBS_V0, CF_GRAPH_V0, CF_ID_V0, CF_METADATA_V0};
-use crate::Config;
+use crate::{
+    cf::{GraphV0, MetadataV0, CF_BLOBS_V0, CF_GRAPH_V0, CF_ID_V0, CF_METADATA_V0},
+    Config,
+};
 
 #[derive(Clone)]
 pub struct Store {
@@ -31,44 +32,9 @@ pub struct Store {
 }
 
 struct InnerStore {
-    content: RocksDb,
+    content: Environment<WriteMap>,
     next_id: AtomicU64,
-    _cache: Cache,
     _rpc_client: RpcClient,
-}
-
-/// Creates the default rocksdb options
-fn default_options() -> (Options, Cache) {
-    let mut opts = Options::default();
-    opts.set_write_buffer_size(512 * 1024 * 1024);
-    opts.optimize_for_point_lookup(64 * 1024 * 1024);
-    let par = (available_parallelism().map(|s| s.get()).unwrap_or(2) / 4).min(2);
-    opts.increase_parallelism(par as _);
-    opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-    opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
-    opts.set_blob_compression_type(rocksdb::DBCompressionType::Lz4);
-    opts.set_bytes_per_sync(1_048_576);
-    opts.set_blob_file_size(512 * 1024 * 1024);
-
-    let cache = Cache::new_lru_cache(128 * 1024 * 1024).unwrap();
-    let mut bopts = BlockBasedOptions::default();
-    // all our data is longer lived, so ribbon filters make sense
-    bopts.set_ribbon_filter(10.0);
-    bopts.set_block_cache(&cache);
-    bopts.set_block_size(6 * 1024);
-    bopts.set_cache_index_and_filter_blocks(true);
-    bopts.set_pin_l0_filter_and_index_blocks_in_cache(true);
-    opts.set_block_based_table_factory(&bopts);
-
-    (opts, cache)
-}
-
-fn default_blob_opts() -> Options {
-    let mut opts = Options::default();
-    opts.set_enable_blob_files(true);
-    opts.set_min_blob_size(5 * 1024);
-
-    opts
 }
 
 /// The key used in CF_ID_V0
@@ -96,28 +62,15 @@ impl Store {
     /// Creates a new database.
     #[tracing::instrument]
     pub async fn create(config: Config) -> Result<Self> {
-        let (mut options, cache) = default_options();
-        options.create_if_missing(true);
-
         let path = config.path.clone();
         let db = task::spawn_blocking(move || -> Result<_> {
-            let mut db = RocksDb::open(&options, path)?;
-            {
-                let opts = default_blob_opts();
-                db.create_cf(CF_BLOBS_V0, &opts)?;
-            }
-            {
-                let opts = Options::default();
-                db.create_cf(CF_METADATA_V0, &opts)?;
-            }
-            {
-                let opts = Options::default();
-                db.create_cf(CF_GRAPH_V0, &opts)?;
-            }
-            {
-                let opts = Options::default();
-                db.create_cf(CF_ID_V0, &opts)?;
-            }
+            let db = libmdbx::Environment::new().set_max_dbs(4).open(&path)?;
+            let tx = db.begin_rw_txn()?;
+            tx.create_db(Some(CF_BLOBS_V0), DatabaseFlags::default())?;
+            tx.create_db(Some(CF_METADATA_V0), DatabaseFlags::default())?;
+            tx.create_db(Some(CF_GRAPH_V0), DatabaseFlags::default())?;
+            tx.create_db(Some(CF_ID_V0), DatabaseFlags::default())?;
+            tx.commit()?;
 
             Ok(db)
         })
@@ -131,7 +84,6 @@ impl Store {
             inner: Arc::new(InnerStore {
                 content: db,
                 next_id: 1.into(),
-                _cache: cache,
                 _rpc_client,
             }),
         })
@@ -140,28 +92,17 @@ impl Store {
     /// Opens an existing database.
     #[tracing::instrument]
     pub async fn open(config: Config) -> Result<Self> {
-        let (mut options, cache) = default_options();
-        options.create_if_missing(false);
-        // TODO: find a way to read existing options
-
         let path = config.path.clone();
         let (db, next_id) = task::spawn_blocking(move || -> Result<_> {
-            let db = RocksDb::open_cf(
-                &options,
-                path,
-                [CF_BLOBS_V0, CF_METADATA_V0, CF_GRAPH_V0, CF_ID_V0],
-            )?;
+            let db = libmdbx::Environment::new().set_max_dbs(4).open(&path)?;
 
             // read last inserted id
             let next_id = {
-                let cf_meta = db
-                    .cf_handle(CF_METADATA_V0)
-                    .ok_or_else(|| anyhow!("missing column family: metadata"))?;
-
-                let mut iter = db.full_iterator_cf(&cf_meta, IteratorMode::End);
-                let last_id = iter
-                    .next()
-                    .and_then(|r| r.ok())
+                let tx = db.begin_ro_txn()?;
+                let db = tx.open_db(Some(CF_METADATA_V0))?;
+                let last_id = tx
+                    .cursor(&db)?
+                    .last::<Cow<_>, Cow<_>>()?
                     .and_then(|(key, _)| key[..8].try_into().ok())
                     .map(u64::from_be_bytes)
                     .unwrap_or_default();
@@ -183,7 +124,6 @@ impl Store {
             inner: Arc::new(InnerStore {
                 content: db,
                 next_id: next_id.into(),
-                _cache: cache,
                 _rpc_client,
             }),
         })
@@ -196,7 +136,9 @@ impl Store {
     {
         inc!(StoreMetrics::PutRequests);
 
-        if self.has(&cid).await? {
+        let tx = self.inner.content.begin_rw_txn()?;
+
+        if Self::priv_has(&tx, &cid)? {
             return Ok(());
         }
 
@@ -215,23 +157,39 @@ impl Store {
         let metadata_bytes = rkyv::to_bytes::<_, 1024>(&metadata)?; // TODO: is this the right amount of scratch space?
         let id_key = id_key(&cid);
 
-        let children = self.ensure_id_many(links.into_iter()).await?;
+        let children = Self::ensure_id_many(&tx, || self.next_id(), links.into_iter()).await?;
 
         let graph = GraphV0 { children };
         let graph_bytes = rkyv::to_bytes::<_, 1024>(&graph)?; // TODO: is this the right amount of scratch space?
 
-        let cf_id = self.cf_id()?;
-        let cf_meta = self.cf_metadata()?;
-        let cf_graph = self.cf_graph()?;
-        let cf_blobs = self.cf_blobs()?;
         let blob_size = blob.as_ref().len();
 
-        let mut batch = WriteBatch::default();
-        batch.put_cf(cf_id, id_key, &id_bytes);
-        batch.put_cf(cf_blobs, &id_bytes, blob);
-        batch.put_cf(cf_meta, &id_bytes, metadata_bytes);
-        batch.put_cf(cf_graph, &id_bytes, graph_bytes);
-        self.db().write(batch)?;
+        tx.put(
+            &tx.open_db(Some(CF_ID_V0))?,
+            id_key,
+            &id_bytes,
+            WriteFlags::UPSERT,
+        )?;
+        tx.put(
+            &tx.open_db(Some(CF_BLOBS_V0))?,
+            &id_bytes,
+            blob,
+            WriteFlags::UPSERT,
+        )?;
+        tx.put(
+            &tx.open_db(Some(CF_METADATA_V0))?,
+            &id_bytes,
+            metadata_bytes,
+            WriteFlags::UPSERT,
+        )?;
+        tx.put(
+            &tx.open_db(Some(CF_GRAPH_V0))?,
+            &id_bytes,
+            graph_bytes,
+            WriteFlags::UPSERT,
+        )?;
+
+        tx.commit()?;
         observe!(StoreHistograms::PutRequests, start.elapsed().as_secs_f64());
         record!(StoreMetrics::PutBytes, blob_size as u64);
 
@@ -239,16 +197,13 @@ impl Store {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn get_blob_by_hash(&self, hash: &Multihash) -> Result<Option<DBPinnableSlice<'_>>> {
-        let cf_blobs = self
-            .inner
-            .content
-            .cf_handle(CF_BLOBS_V0)
-            .ok_or_else(|| anyhow!("missing column family: blobs"))?;
-        for elem in self.get_ids_for_hash(hash)? {
+    pub async fn get_blob_by_hash(&self, hash: &Multihash) -> Result<Option<Vec<u8>>> {
+        let tx = self.inner.content.begin_ro_txn()?;
+        let cf_blobs = tx.open_db(Some(CF_BLOBS_V0))?;
+        for elem in Self::get_ids_for_hash(&tx, hash)? {
             let id = elem?.id;
             let id_bytes = id.to_be_bytes();
-            if let Some(blob) = self.inner.content.get_pinned_cf(&cf_blobs, &id_bytes)? {
+            if let Some(blob) = tx.get(&cf_blobs, &id_bytes)? {
                 return Ok(Some(blob));
             }
         }
@@ -257,15 +212,12 @@ impl Store {
 
     #[tracing::instrument(skip(self))]
     pub async fn has_blob_for_hash(&self, hash: &Multihash) -> Result<bool> {
-        let cf_blobs = self
-            .inner
-            .content
-            .cf_handle(CF_BLOBS_V0)
-            .ok_or_else(|| anyhow!("missing column family: blobs"))?;
-        for elem in self.get_ids_for_hash(hash)? {
+        let tx = self.inner.content.begin_ro_txn()?;
+        let cf_blobs = tx.open_db(Some(CF_BLOBS_V0))?;
+        for elem in Self::get_ids_for_hash(&tx, hash)? {
             let id = elem?.id;
             let id_bytes = id.to_be_bytes();
-            if let Some(_blob) = self.inner.content.get_pinned_cf(&cf_blobs, &id_bytes)? {
+            if let Some(_blob) = tx.get::<()>(&cf_blobs, &id_bytes)? {
                 return Ok(true);
             }
         }
@@ -273,12 +225,13 @@ impl Store {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn get(&self, cid: &Cid) -> Result<Option<DBPinnableSlice<'_>>> {
+    pub async fn get(&self, cid: &Cid) -> Result<Option<Vec<u8>>> {
         inc!(StoreMetrics::GetRequests);
         let start = std::time::Instant::now();
-        let res = match self.get_id(cid).await? {
+        let tx = self.inner.content.begin_ro_txn()?;
+        let res = match Self::get_id(&tx, cid)? {
             Some(id) => {
-                let maybe_blob = self.get_by_id(id).await?;
+                let maybe_blob = Self::get_by_id(&tx, id)?.map(|v| v.into_owned());
                 inc!(StoreMetrics::StoreHit);
                 record!(
                     StoreMetrics::GetBytes,
@@ -297,10 +250,11 @@ impl Store {
 
     #[tracing::instrument(skip(self))]
     pub async fn get_size(&self, cid: &Cid) -> Result<Option<usize>> {
-        match self.get_id(cid).await? {
+        let tx = self.inner.content.begin_ro_txn()?;
+        match Self::get_id(&tx, cid)? {
             Some(id) => {
                 inc!(StoreMetrics::StoreHit);
-                let maybe_size = self.get_size_by_id(id).await?;
+                let maybe_size = Self::get_size_by_id(&tx, id)?;
                 Ok(maybe_size)
             }
             None => {
@@ -310,14 +264,15 @@ impl Store {
         }
     }
 
-    #[tracing::instrument(skip(self))]
-    pub async fn has(&self, cid: &Cid) -> Result<bool> {
-        match self.get_id(cid).await? {
+    #[tracing::instrument(skip(tx))]
+    fn priv_has<'tx, K: TransactionKind, E: EnvironmentKind>(
+        tx: &'tx libmdbx::Transaction<'tx, K, E>,
+        cid: &Cid,
+    ) -> Result<bool> {
+        match Self::get_id(tx, cid)? {
             Some(id) => {
-                let cf_blobs = self.cf_blobs()?;
-                let exists = self
-                    .db()
-                    .get_pinned_cf(cf_blobs, id.to_be_bytes())?
+                let exists = tx
+                    .get::<()>(&tx.open_db(Some(CF_BLOBS_V0))?, &id.to_be_bytes())?
                     .is_some();
                 Ok(exists)
             }
@@ -326,12 +281,19 @@ impl Store {
     }
 
     #[tracing::instrument(skip(self))]
+    pub async fn has(&self, cid: &Cid) -> Result<bool> {
+        let tx = self.inner.content.begin_ro_txn()?;
+        Self::priv_has(&tx, cid)
+    }
+
+    #[tracing::instrument(skip(self))]
     pub async fn get_links(&self, cid: &Cid) -> Result<Option<Vec<Cid>>> {
         inc!(StoreMetrics::GetLinksRequests);
         let start = std::time::Instant::now();
-        let res = match self.get_id(cid).await? {
+        let tx = self.inner.content.begin_ro_txn()?;
+        let res = match Self::get_id(&tx, cid)? {
             Some(id) => {
-                let maybe_links = self.get_links_by_id(id).await?;
+                let maybe_links = Self::get_links_by_id(&tx, id)?;
                 inc!(StoreMetrics::GetLinksHit);
                 Ok(maybe_links)
             }
@@ -347,11 +309,13 @@ impl Store {
         res
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn get_id(&self, cid: &Cid) -> Result<Option<u64>> {
-        let cf_id = self.cf_id()?;
+    #[tracing::instrument(skip(tx))]
+    fn get_id<'tx, K: TransactionKind, E: EnvironmentKind>(
+        tx: &libmdbx::Transaction<'_, K, E>,
+        cid: &Cid,
+    ) -> Result<Option<u64>> {
         let id_key = id_key(cid);
-        let maybe_id_bytes = self.db().get_pinned_cf(cf_id, id_key)?;
+        let maybe_id_bytes = tx.get::<Cow<_>>(&tx.open_db(Some(CF_ID_V0))?, &id_key)?;
         match maybe_id_bytes {
             Some(bytes) => {
                 let arr = bytes[..8].try_into().map_err(|e| anyhow!("{:?}", e))?;
@@ -361,20 +325,13 @@ impl Store {
         }
     }
 
-    fn get_ids_for_hash(
-        &self,
+    fn get_ids_for_hash<'tx, K: TransactionKind, E: EnvironmentKind>(
+        tx: &'tx libmdbx::Transaction<'tx, K, E>,
         hash: &Multihash,
-    ) -> Result<impl Iterator<Item = Result<CodeAndId>> + '_> {
+    ) -> Result<impl Iterator<Item = Result<CodeAndId>> + 'tx> {
         let hash = hash.to_bytes();
-        let cf_id = self
-            .inner
-            .content
-            .cf_handle(CF_ID_V0)
-            .ok_or_else(|| anyhow!("missing column family: id"))?;
-        let iter = self
-            .inner
-            .content
-            .iterator_cf(cf_id, IteratorMode::From(&hash, Direction::Forward));
+        let cf_id = tx.open_db(Some(CF_ID_V0))?;
+        let iter = tx.cursor(&cf_id)?.into_iter_from::<Cow<_>, Cow<_>>(&hash);
         let hash_len = hash.len();
         Ok(iter
             .take_while(move |elem| {
@@ -393,55 +350,51 @@ impl Store {
             }))
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn get_by_id(&self, id: u64) -> Result<Option<DBPinnableSlice<'_>>> {
-        let cf_blobs = self.cf_blobs()?;
-        let maybe_blob = self.db().get_pinned_cf(cf_blobs, id.to_be_bytes())?;
+    #[tracing::instrument(skip(tx))]
+    fn get_by_id<'tx, K: TransactionKind, E: EnvironmentKind>(
+        tx: &'tx libmdbx::Transaction<'tx, K, E>,
+        id: u64,
+    ) -> Result<Option<Cow<'tx, [u8]>>> {
+        let maybe_blob = tx.get::<Cow<_>>(&tx.open_db(Some(CF_BLOBS_V0))?, &id.to_be_bytes())?;
 
         Ok(maybe_blob)
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn get_size_by_id(&self, id: u64) -> Result<Option<usize>> {
-        let cf_blobs = self
-            .inner
-            .content
-            .cf_handle(CF_BLOBS_V0)
-            .ok_or_else(|| anyhow!("missing column family: blobs"))?;
-        let maybe_blob = self
-            .inner
-            .content
-            .get_pinned_cf(cf_blobs, id.to_be_bytes())?;
+    #[tracing::instrument(skip(tx))]
+    fn get_size_by_id<'tx, K: TransactionKind, E: EnvironmentKind>(
+        tx: &'tx libmdbx::Transaction<'tx, K, E>,
+        id: u64,
+    ) -> Result<Option<usize>> {
+        let cf_blobs = tx.open_db(Some(CF_BLOBS_V0))?;
+        let maybe_blob = tx.get::<Cow<_>>(&cf_blobs, &id.to_be_bytes())?;
         let maybe_size = maybe_blob.map(|b| b.len());
         Ok(maybe_size)
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn get_links_by_id(&self, id: u64) -> Result<Option<Vec<Cid>>> {
-        let cf_graph = self.cf_graph()?;
+    #[tracing::instrument(skip(tx))]
+    fn get_links_by_id<'tx, K: TransactionKind, E: EnvironmentKind>(
+        tx: &'tx libmdbx::Transaction<'tx, K, E>,
+        id: u64,
+    ) -> Result<Option<Vec<Cid>>> {
+        let cf_graph = tx.open_db(Some(CF_GRAPH_V0))?;
         let id_bytes = id.to_be_bytes();
         // FIXME: can't use pinned because otherwise this can trigger alignment issues :/
-        match self.db().get_cf(cf_graph, &id_bytes)? {
+        match tx.get::<Cow<_>>(&cf_graph, &id_bytes)? {
             Some(links_id) => {
-                let cf_meta = self.cf_metadata()?;
+                let cf_meta = tx.open_db(Some(CF_METADATA_V0))?;
                 let graph = rkyv::check_archived_root::<GraphV0>(&links_id)
                     .map_err(|e| anyhow!("{:?}", e))?;
-                let keys = graph.children.iter().map(|id| (&cf_meta, id.to_be_bytes()));
-                let meta = self.db().multi_get_cf(keys);
-                let mut links = Vec::with_capacity(meta.len());
-                for (i, meta) in meta.into_iter().enumerate() {
-                    match meta? {
-                        Some(meta) => {
-                            let meta = rkyv::check_archived_root::<MetadataV0>(&meta)
-                                .map_err(|e| anyhow!("{:?}", e))?;
-                            let multihash = cid::multihash::Multihash::from_bytes(&meta.multihash)?;
-                            let c = cid::Cid::new_v1(meta.codec, multihash);
-                            links.push(c);
-                        }
-                        None => {
-                            bail!("invalid link: {}", graph.children[i]);
-                        }
-                    }
+                let mut links = Vec::with_capacity(graph.children.len());
+                for key in graph.children.iter() {
+                    let meta = tx
+                        .get::<Cow<_>>(&cf_meta, &key.to_be_bytes())?
+                        .ok_or_else(|| anyhow::format_err!("invalid link: {}", key))?;
+
+                    let meta = rkyv::check_archived_root::<MetadataV0>(&meta)
+                        .map_err(|e| anyhow!("{:?}", e))?;
+                    let multihash = cid::multihash::Multihash::from_bytes(&meta.multihash)?;
+                    let c = cid::Cid::new_v1(meta.codec, multihash);
+                    links.push(c);
                 }
                 Ok(Some(links))
             }
@@ -450,22 +403,25 @@ impl Store {
     }
 
     /// Takes a list of cids and gives them ids, which are boths stored and then returned.
-    #[tracing::instrument(skip(self, cids))]
-    async fn ensure_id_many<I>(&self, cids: I) -> Result<Vec<u64>>
+    #[tracing::instrument(skip(tx, next_id_source, cids))]
+    async fn ensure_id_many<E: EnvironmentKind, I>(
+        tx: &libmdbx::Transaction<'_, RW, E>,
+        next_id_source: impl Fn() -> u64,
+        cids: I,
+    ) -> Result<Vec<u64>>
     where
         I: IntoIterator<Item = Cid>,
     {
-        let cf_id = self.cf_id()?;
-        let cf_meta = self.cf_metadata()?;
+        let cf_id = tx.open_db(Some(CF_ID_V0))?;
+        let cf_meta = tx.open_db(Some(CF_METADATA_V0))?;
 
         let mut ids = Vec::new();
-        let mut batch = WriteBatch::default();
         for cid in cids {
             let id_key = id_key(&cid);
-            let id = if let Some(id) = self.db().get_pinned_cf(cf_id, &id_key)? {
+            let id = if let Some(id) = tx.get::<Cow<_>>(&cf_id, &id_key)? {
                 u64::from_be_bytes(id.as_ref().try_into()?)
             } else {
-                let id = self.next_id();
+                let id = (next_id_source)();
                 let id_bytes = id.to_be_bytes();
 
                 let metadata = MetadataV0 {
@@ -473,13 +429,12 @@ impl Store {
                     multihash: cid.hash().to_bytes(),
                 };
                 let metadata_bytes = rkyv::to_bytes::<_, 1024>(&metadata)?; // TODO: is this the right amount of scratch space?
-                batch.put_cf(&cf_id, id_key, &id_bytes);
-                batch.put_cf(&cf_meta, &id_bytes, metadata_bytes);
+                tx.put(&cf_id, id_key, &id_bytes, WriteFlags::UPSERT)?;
+                tx.put(&cf_meta, &id_bytes, metadata_bytes, WriteFlags::UPSERT)?;
                 id
             };
             ids.push(id);
         }
-        self.db().write(batch)?;
 
         Ok(ids)
     }
@@ -490,34 +445,6 @@ impl Store {
         // TODO: better handling
         assert!(id > 0, "this store is full");
         id
-    }
-
-    fn db(&self) -> &RocksDb {
-        &self.inner.content
-    }
-
-    fn cf_id(&self) -> Result<&ColumnFamily> {
-        self.db()
-            .cf_handle(CF_ID_V0)
-            .context("missing column family: id")
-    }
-
-    fn cf_metadata(&self) -> Result<&ColumnFamily> {
-        self.db()
-            .cf_handle(CF_METADATA_V0)
-            .context("missing column family: metadata")
-    }
-
-    fn cf_blobs(&self) -> Result<&ColumnFamily> {
-        self.db()
-            .cf_handle(CF_BLOBS_V0)
-            .context("missing column family: blobs")
-    }
-
-    fn cf_graph(&self) -> Result<&ColumnFamily> {
-        self.db()
-            .cf_handle(CF_GRAPH_V0)
-            .context("missing column family: graph")
     }
 }
 
@@ -678,7 +605,8 @@ mod tests {
         assert_eq!(store.get_links(&raw_cid).await?.unwrap().len(), 0);
         assert_eq!(store.get_links(&cbor_cid).await?.unwrap().len(), 2);
 
-        let ids = store.get_ids_for_hash(&hash)?;
+        let tx = store.inner.content.begin_ro_txn()?;
+        let ids = Store::get_ids_for_hash(&tx, &hash)?;
         assert_eq!(ids.count(), 2);
         Ok(())
     }
