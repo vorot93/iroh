@@ -15,8 +15,8 @@ use iroh_metrics::{
 };
 use iroh_rpc_client::Client as RpcClient;
 use libmdbx::{
-    DatabaseFlags, Environment, EnvironmentKind, Geometry, TransactionKind, WriteFlags, WriteMap,
-    RW,
+    DatabaseFlags, Environment, EnvironmentBuilder, EnvironmentFlags, EnvironmentKind, Geometry,
+    TransactionKind, WriteFlags, WriteMap, RW,
 };
 use multihash::Multihash;
 use smallvec::SmallVec;
@@ -59,20 +59,29 @@ struct CodeAndId {
     id: u64,
 }
 
+fn default_flags<E: EnvironmentKind>(
+    builder: &mut EnvironmentBuilder<E>,
+) -> &mut EnvironmentBuilder<E> {
+    builder
+        .set_max_dbs(4)
+        .set_flags(EnvironmentFlags {
+            no_rdahead: true,
+            ..Default::default()
+        })
+        .set_geometry(Geometry {
+            size: Some(..2 * 1024 * 1024 * 1024 * 1024),
+            growth_step: Some(4 * 1024 * 1024 * 1024),
+            ..Default::default()
+        })
+}
+
 impl Store {
     /// Creates a new database.
     #[tracing::instrument]
     pub async fn create(config: Config) -> Result<Self> {
         let path = config.path.clone();
         let db = task::spawn_blocking(move || -> Result<_> {
-            let db = libmdbx::Environment::new()
-                .set_max_dbs(4)
-                .set_geometry(Geometry {
-                    size: Some(..2 * 1024 * 1024 * 1024 * 1024),
-                    growth_step: Some(4 * 1024 * 1024 * 1024),
-                    ..Default::default()
-                })
-                .open(&path)?;
+            let db = default_flags(&mut libmdbx::Environment::new()).open(&path)?;
             let tx = db.begin_rw_txn()?;
             tx.create_db(Some(CF_BLOBS_V0), DatabaseFlags::default())?;
             tx.create_db(Some(CF_METADATA_V0), DatabaseFlags::default())?;
@@ -102,14 +111,7 @@ impl Store {
     pub async fn open(config: Config) -> Result<Self> {
         let path = config.path.clone();
         let (db, next_id) = task::spawn_blocking(move || -> Result<_> {
-            let db = libmdbx::Environment::new()
-                .set_max_dbs(4)
-                .set_geometry(Geometry {
-                    size: Some(..4 * 1024 * 1024 * 1024 * 1024),
-                    growth_step: Some(4 * 1024 * 1024 * 1024),
-                    ..Default::default()
-                })
-                .open(&path)?;
+            let db = default_flags(&mut libmdbx::Environment::new()).open(&path)?;
 
             // read last inserted id
             let next_id = {
